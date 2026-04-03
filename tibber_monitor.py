@@ -225,25 +225,30 @@ async def live_task(home_id: str, live_display: Live) -> None:
         try:
             async with websockets.connect(
                 WS_URL,
-                additional_headers={"Authorization": f"Bearer {TIBBER_TOKEN}"},
                 subprotocols=["graphql-transport-ws"],
-                # Keep TCP-level pings going so NAT/firewalls don't drop the connection
                 ping_interval=20,
                 ping_timeout=10,
             ) as ws:
-                # 1. connection_init
-                await ws.send(json.dumps({"type": "connection_init", "payload": {}}))
+                # 1. connection_init — Tibber authenticates via the payload token,
+                #    not the HTTP upgrade header.
+                await ws.send(json.dumps({
+                    "type": "connection_init",
+                    "payload": {"token": TIBBER_TOKEN},
+                }))
 
-                # 2. Wait for connection_ack (respond to pings while waiting)
-                while True:
-                    raw = await ws.recv()
-                    msg = json.loads(raw)
-                    if msg["type"] == "connection_ack":
-                        break
-                    if msg["type"] == "ping":
-                        await ws.send(json.dumps({"type": "pong"}))
-                    if msg["type"] == "connection_error":
-                        raise RuntimeError(f"connection_error: {msg.get('payload')}")
+                # 2. Wait for connection_ack (with timeout so we surface auth errors)
+                try:
+                    while True:
+                        raw = await asyncio.wait_for(ws.recv(), timeout=30)
+                        msg = json.loads(raw)
+                        if msg["type"] == "connection_ack":
+                            break
+                        if msg["type"] == "ping":
+                            await ws.send(json.dumps({"type": "pong"}))
+                        if msg["type"] == "connection_error":
+                            raise RuntimeError(f"connection_error: {msg.get('payload')}")
+                except asyncio.TimeoutError:
+                    raise RuntimeError("Timed out waiting for connection_ack — check token")
 
                 # 3. Subscribe
                 await ws.send(json.dumps({
