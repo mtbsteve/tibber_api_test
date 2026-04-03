@@ -101,31 +101,21 @@ def build_display() -> Table:
 
         # Instant power
         t2.add_row("[bold]Instant Power[/bold]", "")
-        t2.add_row("  Consumption", _fmt(live.get("power"), "W", 0))
-        t2.add_row("  Production", _fmt(live.get("powerProduction"), "W", 0))
+        t2.add_row("  Current", _fmt(live.get("power"), "W", 0))
+        t2.add_row("  Min today", _fmt(live.get("minPower"), "W", 0))
+        t2.add_row("  Average today", _fmt(live.get("averagePower"), "W", 0))
+        t2.add_row("  Max today", _fmt(live.get("maxPower"), "W", 0))
 
         # Accumulated today
+        currency = live.get("currency", "")
         t2.add_row("", "")
         t2.add_row("[bold]Accumulated Today[/bold]", "")
         t2.add_row("  Consumption", _fmt(live.get("accumulatedConsumption"), "kWh"))
-        t2.add_row("  Production",  _fmt(live.get("accumulatedProduction"), "kWh"))
+        t2.add_row("  Cost", _fmt(live.get("accumulatedCost"), currency, 4))
 
-        # Last hour
-        t2.add_row("", "")
-        t2.add_row("[bold]Last Hour[/bold]", "")
-        t2.add_row("  Consumption", _fmt(live.get("accumulatedConsumptionLastHour"), "kWh"))
-        t2.add_row("  Production",  _fmt(live.get("accumulatedProductionLastHour"), "kWh"))
-
-        # Meter totals
-        t2.add_row("", "")
-        t2.add_row("[bold]Meter Readings (total)[/bold]", "")
-        t2.add_row("  Total import (consumption)", _fmt(live.get("lastMeterConsumption"), "kWh"))
-        t2.add_row("  Total export (production)",  _fmt(live.get("lastMeterProduction"), "kWh"))
-
-        ts = live.get("timestamp", "N/A")
         upd = state.get("last_live_update")
         t2.add_row("", "")
-        t2.add_row("Meter timestamp", str(ts))
+        t2.add_row("Timestamp", str(live.get("timestamp", "N/A")))
         t2.add_row("Last received", upd.strftime("%H:%M:%S") if upd else "—")
 
         root.add_row(Panel(t2, title="[bold]Live Measurements[/bold]", border_style="yellow"))
@@ -171,13 +161,12 @@ subscription {
   liveMeasurement(homeId: "%s") {
     timestamp
     power
-    powerProduction
     accumulatedConsumption
-    accumulatedProduction
-    accumulatedConsumptionLastHour
-    accumulatedProductionLastHour
-    lastMeterConsumption
-    lastMeterProduction
+    accumulatedCost
+    currency
+    minPower
+    averagePower
+    maxPower
   }
 }
 """
@@ -223,37 +212,36 @@ async def live_task(home_id: str, live_display: Live) -> None:
         state["live_status"] = "Connecting to live feed..."
         live_display.update(build_display())
         try:
+            # Tibber uses the older Apollo graphql-ws protocol (not graphql-transport-ws)
             async with websockets.connect(
                 WS_URL,
-                subprotocols=["graphql-transport-ws"],
-                ping_interval=20,
-                ping_timeout=10,
+                subprotocols=["graphql-ws"],
+                ping_interval=None,   # app-layer keep-alive ("ka") handles this
             ) as ws:
-                # 1. connection_init — Tibber authenticates via the payload token,
-                #    not the HTTP upgrade header.
+                # 1. connection_init — token in payload (no "Bearer " prefix)
                 await ws.send(json.dumps({
                     "type": "connection_init",
                     "payload": {"token": TIBBER_TOKEN},
                 }))
 
-                # 2. Wait for connection_ack (with timeout so we surface auth errors)
+                # 2. Wait for connection_ack (ka messages may arrive first)
                 try:
                     while True:
                         raw = await asyncio.wait_for(ws.recv(), timeout=30)
                         msg = json.loads(raw)
                         if msg["type"] == "connection_ack":
                             break
-                        if msg["type"] == "ping":
-                            await ws.send(json.dumps({"type": "pong"}))
+                        if msg["type"] == "ka":
+                            pass  # keep-alive, no reply needed in graphql-ws
                         if msg["type"] == "connection_error":
-                            raise RuntimeError(f"connection_error: {msg.get('payload')}")
+                            raise RuntimeError(f"Auth error: {msg.get('payload')}")
                 except asyncio.TimeoutError:
                     raise RuntimeError("Timed out waiting for connection_ack — check token")
 
-                # 3. Subscribe
+                # 3. Start subscription (old protocol uses "start", not "subscribe")
                 await ws.send(json.dumps({
                     "id": "1",
-                    "type": "subscribe",
+                    "type": "start",
                     "payload": {"query": query},
                 }))
 
@@ -265,7 +253,7 @@ async def live_task(home_id: str, live_display: Live) -> None:
                     msg = json.loads(raw)
                     t = msg.get("type")
 
-                    if t == "next":
+                    if t == "data":   # old protocol calls it "data", not "next"
                         live_data = (
                             msg.get("payload", {})
                                .get("data", {})
@@ -275,9 +263,8 @@ async def live_task(home_id: str, live_display: Live) -> None:
                         state["last_live_update"] = datetime.now()
                         live_display.update(build_display())
 
-                    elif t == "ping":
-                        # Must reply or server closes connection within ~10 s
-                        await ws.send(json.dumps({"type": "pong"}))
+                    elif t == "ka":
+                        pass  # keep-alive heartbeat — no reply needed
 
                     elif t == "error":
                         raise RuntimeError(f"Subscription error: {msg.get('payload')}")
