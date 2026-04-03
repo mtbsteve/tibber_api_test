@@ -10,13 +10,14 @@ Usage:
 """
 
 import asyncio
+import json
 import os
 import sys
 from datetime import datetime
 
+import websockets
 from gql import gql, Client
 from gql.transport.aiohttp import AIOHTTPTransport
-from gql.transport.websockets import WebsocketsTransport
 from rich.console import Console
 from rich.live import Live
 from rich.table import Table
@@ -165,9 +166,9 @@ PRICE_QUERY = gql("""
 
 HOME_ID_QUERY = gql("{ viewer { homes { id } } }")
 
-LIVE_SUBSCRIPTION = gql("""
-subscription LiveMeasurement($homeId: ID!) {
-  liveMeasurement(homeId: $homeId) {
+LIVE_SUBSCRIPTION_QUERY = """
+subscription {
+  liveMeasurement(homeId: "%s") {
     timestamp
     power
     powerProduction
@@ -179,7 +180,7 @@ subscription LiveMeasurement($homeId: ID!) {
     lastMeterProduction
   }
 }
-""")
+"""
 
 
 # ---------------------------------------------------------------------------
@@ -215,22 +216,71 @@ async def price_task(live_display: Live) -> None:
 
 
 async def live_task(home_id: str, live_display: Live) -> None:
-    """Subscribe to live measurements, auto-reconnect on failure."""
+    """Subscribe to live measurements via raw WebSocket with full ping/pong handling."""
+    query = LIVE_SUBSCRIPTION_QUERY % home_id
+
     while True:
         state["live_status"] = "Connecting to live feed..."
         live_display.update(build_display())
         try:
-            transport = WebsocketsTransport(url=WS_URL, headers=HEADERS)
-            async with Client(transport=transport, fetch_schema_from_transport=False) as session:
+            async with websockets.connect(
+                WS_URL,
+                additional_headers={"Authorization": f"Bearer {TIBBER_TOKEN}"},
+                subprotocols=["graphql-transport-ws"],
+                # Keep TCP-level pings going so NAT/firewalls don't drop the connection
+                ping_interval=20,
+                ping_timeout=10,
+            ) as ws:
+                # 1. connection_init
+                await ws.send(json.dumps({"type": "connection_init", "payload": {}}))
+
+                # 2. Wait for connection_ack (respond to pings while waiting)
+                while True:
+                    raw = await ws.recv()
+                    msg = json.loads(raw)
+                    if msg["type"] == "connection_ack":
+                        break
+                    if msg["type"] == "ping":
+                        await ws.send(json.dumps({"type": "pong"}))
+                    if msg["type"] == "connection_error":
+                        raise RuntimeError(f"connection_error: {msg.get('payload')}")
+
+                # 3. Subscribe
+                await ws.send(json.dumps({
+                    "id": "1",
+                    "type": "subscribe",
+                    "payload": {"query": query},
+                }))
+
                 state["live_status"] = "Connected"
-                async for result in session.subscribe(
-                    LIVE_SUBSCRIPTION,
-                    variable_values={"homeId": home_id},
-                ):
-                    data = (result or {}).get("liveMeasurement") or {}
-                    state["live"] = data
-                    state["last_live_update"] = datetime.now()
-                    live_display.update(build_display())
+                live_display.update(build_display())
+
+                # 4. Receive messages indefinitely
+                async for raw in ws:
+                    msg = json.loads(raw)
+                    t = msg.get("type")
+
+                    if t == "next":
+                        live_data = (
+                            msg.get("payload", {})
+                               .get("data", {})
+                               .get("liveMeasurement") or {}
+                        )
+                        state["live"] = live_data
+                        state["last_live_update"] = datetime.now()
+                        live_display.update(build_display())
+
+                    elif t == "ping":
+                        # Must reply or server closes connection within ~10 s
+                        await ws.send(json.dumps({"type": "pong"}))
+
+                    elif t == "error":
+                        raise RuntimeError(f"Subscription error: {msg.get('payload')}")
+
+                    elif t == "complete":
+                        state["live_status"] = "Subscription ended by server"
+                        break
+
         except Exception as exc:
             state["live"] = None
             state["live_status"] = f"Disconnected ({exc}) — retrying in 10 s..."
