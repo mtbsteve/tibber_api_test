@@ -15,7 +15,7 @@ import os
 import sys
 from datetime import datetime
 
-import websockets
+import aiohttp
 from gql import gql, Client
 from gql.transport.aiohttp import AIOHTTPTransport
 from rich.console import Console
@@ -205,73 +205,69 @@ async def price_task(live_display: Live) -> None:
 
 
 async def live_task(home_id: str, live_display: Live) -> None:
-    """Subscribe to live measurements via raw WebSocket with full ping/pong handling."""
+    """Subscribe to live measurements using aiohttp WebSocket (graphql-ws protocol)."""
     query = LIVE_SUBSCRIPTION_QUERY % home_id
 
     while True:
         state["live_status"] = "Connecting to live feed..."
         live_display.update(build_display())
         try:
-            # Tibber uses the older Apollo graphql-ws protocol (not graphql-transport-ws)
-            async with websockets.connect(
-                WS_URL,
-                subprotocols=["graphql-ws"],
-                ping_interval=None,   # app-layer keep-alive ("ka") handles this
-            ) as ws:
-                # 1. connection_init — token in payload (no "Bearer " prefix)
-                await ws.send(json.dumps({
-                    "type": "connection_init",
-                    "payload": {"token": TIBBER_TOKEN},
-                }))
+            async with aiohttp.ClientSession() as session:
+                async with session.ws_connect(
+                    WS_URL,
+                    headers={"Authorization": f"Bearer {TIBBER_TOKEN}"},
+                    protocols=["graphql-ws"],
+                    heartbeat=60,
+                ) as ws:
+                    # 1. connection_init — auth is in the HTTP header above;
+                    #    payload is intentionally empty.
+                    await ws.send_str(json.dumps({
+                        "type": "connection_init",
+                        "payload": {},
+                    }))
 
-                # 2. Wait for connection_ack (ka messages may arrive first)
-                try:
-                    while True:
-                        raw = await asyncio.wait_for(ws.recv(), timeout=30)
-                        msg = json.loads(raw)
-                        if msg["type"] == "connection_ack":
-                            break
-                        if msg["type"] == "ka":
-                            pass  # keep-alive, no reply needed in graphql-ws
-                        if msg["type"] == "connection_error":
-                            raise RuntimeError(f"Auth error: {msg.get('payload')}")
-                except asyncio.TimeoutError:
-                    raise RuntimeError("Timed out waiting for connection_ack — check token")
+                    ack = False
+                    async for msg in ws:
+                        if msg.type == aiohttp.WSMsgType.ERROR:
+                            raise RuntimeError(ws.exception())
+                        if msg.type != aiohttp.WSMsgType.TEXT:
+                            continue
 
-                # 3. Start subscription (old protocol uses "start", not "subscribe")
-                await ws.send(json.dumps({
-                    "id": "1",
-                    "type": "start",
-                    "payload": {"query": query},
-                }))
+                        data = json.loads(msg.data)
+                        t = data.get("type")
 
-                state["live_status"] = "Connected"
-                live_display.update(build_display())
-
-                # 4. Receive messages indefinitely
-                async for raw in ws:
-                    msg = json.loads(raw)
-                    t = msg.get("type")
-
-                    if t == "data":   # old protocol calls it "data", not "next"
-                        live_data = (
-                            msg.get("payload", {})
-                               .get("data", {})
-                               .get("liveMeasurement") or {}
-                        )
-                        state["live"] = live_data
-                        state["last_live_update"] = datetime.now()
-                        live_display.update(build_display())
-
-                    elif t == "ka":
-                        pass  # keep-alive heartbeat — no reply needed
-
-                    elif t == "error":
-                        raise RuntimeError(f"Subscription error: {msg.get('payload')}")
-
-                    elif t == "complete":
-                        state["live_status"] = "Subscription ended by server"
-                        break
+                        if not ack:
+                            if t == "connection_ack":
+                                ack = True
+                                # 2. Send the subscription with the correct home ID
+                                await ws.send_str(json.dumps({
+                                    "id": "1",
+                                    "type": "start",
+                                    "payload": {"query": query},
+                                }))
+                                state["live_status"] = "Connected"
+                                live_display.update(build_display())
+                            elif t == "ka":
+                                pass
+                            elif t == "connection_error":
+                                raise RuntimeError(f"Auth error: {data.get('payload')}")
+                        else:
+                            if t == "data":
+                                live_data = (
+                                    data.get("payload", {})
+                                        .get("data", {})
+                                        .get("liveMeasurement") or {}
+                                )
+                                state["live"] = live_data
+                                state["last_live_update"] = datetime.now()
+                                live_display.update(build_display())
+                            elif t == "ka":
+                                pass
+                            elif t == "error":
+                                raise RuntimeError(f"Subscription error: {data.get('payload')}")
+                            elif t == "complete":
+                                state["live_status"] = "Subscription ended by server"
+                                break
 
         except Exception as exc:
             state["live"] = None
